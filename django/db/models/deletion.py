@@ -1,5 +1,6 @@
 from collections import Counter
 from operator import attrgetter
+from itertools import chain
 
 from django.db import IntegrityError, connections, transaction
 from django.db.models import signals, sql
@@ -60,18 +61,6 @@ def get_candidate_relations_to_delete(opts):
     )
 
 
-def get_required_fields(model):
-    opts = model._meta
-    fields = {opts.pk.attname}
-    for ptr in opts.parents.values():
-        if ptr:
-            fields.add(ptr.attname)
-    for field in opts.concrete_fields:
-        if field.is_relation and field.remote_field.on_delete is not DO_NOTHING:
-            fields.add(field.attname)
-    return list(fields)
-
-
 class Collector:
     def __init__(self, using):
         self.using = using
@@ -88,6 +77,12 @@ class Collector:
         # database tables; proxy models are represented here by their concrete
         # parent.
         self.dependencies = {}  # {model: {models}}
+
+    def _has_signal_listeners(self, model):
+        return (
+            signals.pre_delete.has_listeners(model) or
+            signals.post_delete.has_listeners(model)
+        )
 
     def add(self, objs, source=None, nullable=False, reverse_dependency=False):
         """
@@ -232,8 +227,16 @@ class Collector:
                     sub_objs = self.related_objects(related, batch)
                     if self.can_fast_delete(sub_objs, from_field=field):
                         self.fast_deletes.append(sub_objs)
-                    elif sub_objs:
-                        field.remote_field.on_delete(self, field, sub_objs, self.using)
+                    else:
+                        related_model = related.related_model
+                        if not (sub_objs.query.select_related or self._has_signal_listeners(related_model)):
+                            referenced_fields = set(chain.from_iterable(
+                                (rf.attname for rf in rel.field.foreign_related_fields)
+                                for rel in get_candidate_relations_to_delete(related_model._meta)
+                            ))
+                            sub_objs = sub_objs.only(*tuple(referenced_fields))
+                        if sub_objs:
+                            field.remote_field.on_delete(self, field, sub_objs, self.using)
             for field in model._meta.private_fields:
                 if hasattr(field, 'bulk_related_objects'):
                     # It's something like generic foreign key.
@@ -246,7 +249,7 @@ class Collector:
         """
         return related.related_model._base_manager.using(self.using).filter(
             **{"%s__in" % related.field.name: objs}
-        ).only(*get_required_fields(related.related_model))
+        )
 
     def instances_with_model(self):
         for model, instances in self.data.items():
