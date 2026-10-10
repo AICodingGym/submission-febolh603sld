@@ -67,7 +67,7 @@ def get_required_fields(model):
         if ptr:
             fields.add(ptr.attname)
     for field in opts.concrete_fields:
-        if field.is_relation:
+        if field.is_relation and field.remote_field.on_delete is not DO_NOTHING:
             fields.add(field.attname)
     return list(fields)
 
